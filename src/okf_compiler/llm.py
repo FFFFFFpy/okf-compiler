@@ -28,6 +28,7 @@ ENV_BASE_URL = "OKF_LLM_BASE_URL"
 ENV_MODEL = "OKF_LLM_MODEL"
 ENV_API_KEY = "OKF_LLM_API_KEY"
 ENV_TIMEOUT = "OKF_LLM_TIMEOUT"
+ENV_FILE = "OKF_ENV_FILE"
 _LEGACY = {
     ENV_BASE_URL: "OPENKB_LLM_BASE_URL",
     ENV_MODEL: "OPENKB_LLM_MODEL",
@@ -50,8 +51,58 @@ class LLMConfig:
         return bool(self.model and self.model.strip())
 
 
-def load_dotenv_values(path: Path | None = None) -> dict[str, str]:
-    values = dotenv_values(path or ".env")
+def find_dotenv_path(
+    path: Path | None = None,
+    *,
+    search_dirs: list[Path] | tuple[Path, ...] | None = None,
+    env: dict[str, str] | None = None,
+) -> Path | None:
+    """Resolve the one dotenv file used for a command.
+
+    Resolution order:
+      1. explicit ``path`` / ``--env-file``;
+      2. ``OKF_ENV_FILE`` from the process environment;
+      3. ``.env`` in the current working directory;
+      4. ``.env`` in each caller-provided search directory.
+
+    Only one file is loaded. Explicit/configured files must exist so a typo
+    cannot silently fall back to unrelated credentials.
+    """
+    current_env = dict(os.environ) if env is None else env
+    explicit = path
+    if explicit is None:
+        configured = current_env.get(ENV_FILE)
+        explicit = Path(configured).expanduser() if configured else None
+
+    if explicit is not None:
+        candidate = Path(explicit).expanduser().resolve()
+        if not candidate.is_file():
+            raise FileNotFoundError(f"dotenv file not found: {candidate}")
+        return candidate
+
+    candidates = [Path.cwd()]
+    candidates.extend(Path(item) for item in (search_dirs or []))
+    seen: set[Path] = set()
+    for directory in candidates:
+        candidate = (directory.expanduser() / ".env").resolve()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def load_dotenv_values(
+    path: Path | None = None,
+    *,
+    search_dirs: list[Path] | tuple[Path, ...] | None = None,
+    env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    resolved = find_dotenv_path(path, search_dirs=search_dirs, env=env)
+    if resolved is None:
+        return {}
+    values = dotenv_values(resolved)
     return {str(k): str(v) for k, v in values.items() if k and v is not None}
 
 
@@ -64,8 +115,8 @@ def resolve_config(
     env: dict[str, str] | None = None,
     dotenv: dict[str, str] | None = None,
 ) -> LLMConfig:
-    env = env or dict(os.environ)
-    dotenv = dotenv or load_dotenv_values()
+    env = dict(os.environ) if env is None else env
+    dotenv = load_dotenv_values() if dotenv is None else dotenv
 
     def pick(value: str | None, name: str) -> str | None:
         if value and value.strip():
