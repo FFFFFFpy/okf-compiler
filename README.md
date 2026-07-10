@@ -57,6 +57,52 @@ cd okf-compiler
 uv sync --extra dev --extra llm
 ```
 
+## Configure the LLM with `.env`
+
+Copy the included template and fill in your provider values:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+```env
+OKF_LLM_BASE_URL=https://api.example.com/v1
+OKF_LLM_MODEL=your-model
+OKF_LLM_API_KEY=your-key
+OKF_LLM_TIMEOUT=120
+```
+
+Then test the connection:
+
+```powershell
+uv run okf test-llm
+```
+
+Configuration priority is:
+
+```text
+CLI flags > process environment > .env > defaults
+```
+
+Dotenv discovery order is:
+
+1. `--env-file PATH`.
+2. The path in `OKF_ENV_FILE`.
+3. `.env` in the current working directory.
+4. `.env` beside the input Markdown or input directory.
+
+Only one dotenv file is loaded. An explicitly selected file must exist; a typo does not silently fall back to some unrelated `.env` lurking elsewhere like a credential poltergeist.
+
+Use a custom file when needed:
+
+```powershell
+uv run okf test-llm --env-file "D:\secrets\okf.env"
+```
+
+`.env` is ignored by Git. `.env.example` is safe to commit and contains no real credentials.
+
+For migration, the old `OPENKB_LLM_*` names remain accepted as fallback values.
+
 ## Compile one Markdown file
 
 Without LLM:
@@ -65,7 +111,13 @@ Without LLM:
 uv run okf compile article.md --no-llm
 ```
 
-With an OpenAI-compatible endpoint:
+With `.env` configured, no repeated LLM flags are needed:
+
+```powershell
+uv run okf compile article.md
+```
+
+CLI flags remain available for one-off overrides:
 
 ```powershell
 uv run okf compile article.md `
@@ -95,23 +147,6 @@ Input selection priority in `wechat` mode:
 3. `document.md`.
 4. The only Markdown file in the directory.
 5. Otherwise the directory is reported as ambiguous and skipped.
-
-## Environment variables
-
-```env
-OKF_LLM_BASE_URL=https://api.example.com/v1
-OKF_LLM_MODEL=your-model
-OKF_LLM_API_KEY=your-key
-OKF_LLM_TIMEOUT=120
-```
-
-For migration, the old `OPENKB_LLM_*` names remain accepted as fallback values.
-
-Test configuration:
-
-```powershell
-uv run okf test-llm
-```
 
 ## Sectioning rules
 
