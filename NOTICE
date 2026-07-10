@@ -1,0 +1,10 @@
+OKF Compiler
+Copyright 2026 FFFFFFpy
+
+This project was extracted and independently adapted from the OKF compiler
+prototype originally developed in FFFFFFpy/OpenKB on the okf_compiler branch.
+OpenKB is derived from VectifyAI/OpenKB and is licensed under Apache License 2.0.
+
+The standalone extraction removes OpenKB runtime and knowledge-base dependencies,
+renames the Python package, and adds portable source metadata and normalized
+source-image handling.
