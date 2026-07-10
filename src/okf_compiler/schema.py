@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field, replace
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
@@ -37,6 +38,9 @@ MEDIA_DIR = "assets/media"
 SOURCE_MAP_JSON = "source_map.json"
 SECTION_INDEX_WIDTH = 2
 SECTION_TYPE = "Section"
+
+_DOUBLE_QUOTES = frozenset('“”„‟＂〝〞〟「」『』')
+_SINGLE_QUOTES = frozenset("‘’‚‛＇")
 
 
 @dataclass
@@ -292,39 +296,46 @@ def _select_section(
 def _locate_quote(section: SectionSpec, markdown: str, quote: str) -> EvidenceValidation:
     lines = markdown.splitlines(keepends=True)
     section_text = "".join(lines[max(section.line_start - 1, 0) : min(section.line_end, len(lines))])
+    frontmatter_end = _frontmatter_end(section, section_text)
 
     exact_positions = _all_positions(section_text, quote)
-    if len(exact_positions) == 1:
-        start = exact_positions[0]
-        return _resolved_quote(section, section_text, quote, start, start + len(quote), "ok_exact_quote")
-    if len(exact_positions) > 1:
-        return EvidenceValidation(
-            False,
-            "ambiguous_quote",
-            replace(section_evidence(section), quote=quote),
-            {"matches": len(exact_positions), "match_mode": "exact"},
-        )
+    exact_choice = _choose_position(exact_positions, lambda position: position, frontmatter_end)
+    if exact_choice is not None:
+        start, body_preferred = exact_choice
+        reason = "ok_exact_quote_body_preferred" if body_preferred else "ok_exact_quote"
+        return _resolved_quote(section, section_text, start, start + len(quote), reason)
+    if exact_positions:
+        return _ambiguous_quote(section, quote, exact_positions, "exact")
 
     normalized_text, mapping = _normalize_with_map(section_text)
-    normalized_quote = re.sub(r"\s+", " ", quote).strip()
-    normalized_positions = _all_positions(normalized_text, normalized_quote) if normalized_quote else []
-    if len(normalized_positions) == 1:
-        norm_start = normalized_positions[0]
+    normalized_quote, _ = _normalize_with_map(quote)
+    normalized_positions = _all_positions(normalized_text, normalized_quote)
+    normalized_choice = _choose_position(
+        normalized_positions,
+        lambda position: mapping[position],
+        frontmatter_end,
+    )
+    if normalized_choice is not None:
+        norm_start, body_preferred = normalized_choice
         norm_end = norm_start + len(normalized_quote) - 1
+        reason = (
+            "ok_normalized_quote_body_preferred"
+            if body_preferred
+            else "ok_normalized_quote"
+        )
         return _resolved_quote(
             section,
             section_text,
-            quote,
             mapping[norm_start],
             mapping[norm_end] + 1,
-            "ok_normalized_quote",
+            reason,
         )
-    if len(normalized_positions) > 1:
-        return EvidenceValidation(
-            False,
-            "ambiguous_quote",
-            replace(section_evidence(section), quote=quote),
-            {"matches": len(normalized_positions), "match_mode": "normalized_whitespace"},
+    if normalized_positions:
+        return _ambiguous_quote(
+            section,
+            quote,
+            normalized_positions,
+            "normalized_typography",
         )
     return EvidenceValidation(
         False,
@@ -334,14 +345,52 @@ def _locate_quote(section: SectionSpec, markdown: str, quote: str) -> EvidenceVa
     )
 
 
+def _ambiguous_quote(
+    section: SectionSpec,
+    quote: str,
+    positions: list[int],
+    match_mode: str,
+) -> EvidenceValidation:
+    return EvidenceValidation(
+        False,
+        "ambiguous_quote",
+        replace(section_evidence(section), quote=quote),
+        {"matches": len(positions), "match_mode": match_mode},
+    )
+
+
+def _choose_position(
+    positions: list[int],
+    original_position,
+    frontmatter_end: int,
+) -> tuple[int, bool] | None:
+    if len(positions) == 1:
+        return positions[0], False
+    if frontmatter_end and positions:
+        body_positions = [p for p in positions if original_position(p) >= frontmatter_end]
+        if len(body_positions) == 1:
+            return body_positions[0], True
+    return None
+
+
+def _frontmatter_end(section: SectionSpec, section_text: str) -> int:
+    if section.line_start != 1 or not section_text.startswith("---"):
+        return 0
+    match = re.search(r"\n---[ \t]*(?:\r?\n|$)", section_text[3:])
+    return 3 + match.end() if match else 0
+
+
 def _resolved_quote(
     section: SectionSpec,
     section_text: str,
-    quote: str,
     start: int,
     end: int,
     reason: str,
 ) -> EvidenceValidation:
+    while start < end and section_text[start].isspace():
+        start += 1
+    while end > start and section_text[end - 1].isspace():
+        end -= 1
     last_char = max(start, end - 1)
     line_start = section.line_start + section_text[:start].count("\n")
     line_end = section.line_start + section_text[:last_char].count("\n")
@@ -350,7 +399,7 @@ def _resolved_quote(
         heading_path=section.heading_path,
         line_start=line_start,
         line_end=max(line_start, line_end),
-        quote=quote,
+        quote=section_text[start:end],
     )
     return EvidenceValidation(True, reason, resolved)
 
@@ -382,19 +431,29 @@ def _normalize_with_map(text: str) -> tuple[str, list[int]]:
     mapping: list[int] = []
     in_space = False
     for index, char in enumerate(text):
-        if char.isspace():
-            if chars and not in_space:
-                chars.append(" ")
-                mapping.append(index)
-            in_space = True
-            continue
-        chars.append(char)
-        mapping.append(index)
-        in_space = False
+        expanded = _normalize_char(char)
+        for normalized in expanded:
+            if normalized.isspace():
+                if chars and not in_space:
+                    chars.append(" ")
+                    mapping.append(index)
+                in_space = True
+                continue
+            chars.append(normalized)
+            mapping.append(index)
+            in_space = False
     while chars and chars[-1] == " ":
         chars.pop()
         mapping.pop()
     return "".join(chars), mapping
+
+
+def _normalize_char(char: str) -> str:
+    if char in _DOUBLE_QUOTES:
+        return '"'
+    if char in _SINGLE_QUOTES:
+        return "'"
+    return unicodedata.normalize("NFKC", char)
 
 
 def okf_yaml_text(title: str) -> str:
