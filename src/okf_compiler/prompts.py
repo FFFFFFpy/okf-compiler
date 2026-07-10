@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 
 from .schema import ConceptExtract, EntityExtract, SectionSpec
 
@@ -10,22 +12,21 @@ from .schema import ConceptExtract, EntityExtract, SectionSpec
 def _section_map(sections: list[SectionSpec]) -> str:
     rows = [
         {
-            "section_id": s.section_id,
-            "heading_path": s.heading_path,
-            "line_start": s.line_start,
-            "line_end": s.line_end,
+            "section_id": section.section_id,
+            "heading_path": section.heading_path,
+            "line_start": section.line_start,
+            "line_end": section.line_end,
         }
-        for s in sections
+        for section in sections
     ]
     return json.dumps(rows, ensure_ascii=False, indent=2)
 
 
 def _evidence_contract() -> str:
     return (
-        'Evidence MUST be an object exactly shaped as '
+        'Evidence MUST be exactly shaped as '
         '{"section_id":"s0001","quote":"verbatim contiguous text copied from Document"}. '
-        "The quote must occur once inside that section, contain no ellipsis or paraphrase, and must not "
-        "include invented line numbers. The compiler resolves quote text to absolute source lines."
+        "Copy the quote exactly. Do not paraphrase, add ellipses, change punctuation, or invent lines."
     )
 
 
@@ -39,11 +40,18 @@ def summary_messages(markdown: str, sections: list[SectionSpec], language: str) 
 
 
 def concepts_messages(
-    markdown: str, sections: list[SectionSpec], max_concepts: int, *, summary: str
+    markdown: str,
+    sections: list[SectionSpec],
+    max_concepts: int,
+    *,
+    summary: str,
 ) -> tuple[str, str]:
     system = (
-        "Extract document-local concepts. Return JSON only with a concepts array. Each item needs "
-        "name, description, confidence, and evidence. " + _evidence_contract()
+        "Extract reusable document-local concepts, mechanisms, strategies, design patterns, and "
+        "business ideas. Do NOT return named people, organizations, products, games, platforms, "
+        "brands, works, places, or events; those belong in entities. Return JSON only with a "
+        "concepts array. Each item needs name, description, confidence, and evidence. "
+        + _evidence_contract()
     )
     user = (
         f"Maximum concepts: {max_concepts}\nSummary: {summary}\n"
@@ -61,15 +69,59 @@ def entities_messages(
     concepts: list[ConceptExtract],
 ) -> tuple[str, str]:
     system = (
-        "Extract document-local named entities. Return JSON only with an entities array. Each item "
-        "needs name, type, description, aliases, confidence, and evidence. " + _evidence_contract()
+        "Extract only concrete named entities. Allowed type values are person, organization, "
+        "product, platform, brand, work, location, event, and other_named_entity. Do NOT return "
+        "abstract concepts, mechanisms, strategies, gameplay patterns, business models, hooks, or "
+        "design labels. Return JSON only with an entities array. Each item needs name, type, "
+        "description, aliases, confidence, and evidence. "
+        + _evidence_contract()
     )
-    concept_names = [c.name for c in concepts]
+    concept_names = [concept.name for concept in concepts]
     user = (
-        f"Maximum entities: {max_entities}\nSummary: {summary}\nConcepts: {concept_names}\n"
+        f"Maximum entities: {max_entities}\nSummary: {summary}\n"
+        f"Known concepts, normally do not repeat as entities: {concept_names}\n"
         f"Section map:\n{_section_map(sections)}\n\nDocument:\n{markdown}"
     )
     return system, user
+
+
+def relation_nodes(
+    concepts: list[ConceptExtract],
+    entities: list[EntityExtract],
+) -> list[dict]:
+    rows: list[dict] = []
+    seen: set[str] = set()
+    concept_index = 1
+    entity_index = 1
+    for concept in concepts:
+        key = _name_key(concept.name)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            {
+                "node_id": f"concept:c{concept_index:04d}",
+                "name": concept.name,
+                "kind": "concept",
+                "type": "concept",
+            }
+        )
+        concept_index += 1
+    for entity in entities:
+        key = _name_key(entity.name)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            {
+                "node_id": f"entity:e{entity_index:04d}",
+                "name": entity.name,
+                "kind": "entity",
+                "type": entity.entity_type,
+            }
+        )
+        entity_index += 1
+    return rows
 
 
 def relations_messages(
@@ -81,13 +133,37 @@ def relations_messages(
     entities: list[EntityExtract],
 ) -> tuple[str, str]:
     system = (
-        "Propose relations between the supplied local concepts/entities only. Return JSON only with "
-        "a relations array. Each relation needs subject, relation, object, note, and evidence. "
+        "Propose evidence-backed relations between the supplied typed nodes only. Return JSON only "
+        "with a relations array. Each relation needs subject_id, relation, object_id, note, and "
+        "evidence. subject_id and object_id MUST be copied from Allowed nodes. "
         + _evidence_contract()
     )
-    nodes = [c.name for c in concepts] + [e.name for e in entities]
+    nodes = relation_nodes(concepts, entities)
     user = (
-        f"Summary: {summary}\nAllowed nodes: {nodes}\n"
+        f"Summary: {summary}\nAllowed nodes:\n"
+        f"{json.dumps(nodes, ensure_ascii=False, indent=2)}\n"
         f"Section map:\n{_section_map(sections)}\n\nDocument:\n{markdown}"
     )
     return system, user
+
+
+def retry_system_message(stage: str, system: str, error: str) -> str:
+    schemas = {
+        "summary": '{"summary":"string"}',
+        "concepts": '{"concepts":[{"name":"...","description":"...","confidence":0.9,'
+        '"evidence":{"section_id":"s0001","quote":"..."}}]}',
+        "entities": '{"entities":[{"name":"...","type":"product","description":"...",'
+        '"aliases":[],"confidence":0.9,"evidence":{"section_id":"s0001","quote":"..."}}]}',
+        "relations": '{"relations":[{"subject_id":"concept:c0001","relation":"uses",'
+        '"object_id":"entity:e0001","note":"...",'
+        '"evidence":{"section_id":"s0001","quote":"..."}}]}',
+    }
+    return (
+        f"{system}\n\nYour previous response was invalid for stage {stage}: {error}. "
+        f"Return one JSON object matching this top-level schema exactly: {schemas[stage]}"
+    )
+
+
+def _name_key(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value)).casefold()
+    return re.sub(r"\s+", "", normalized)
