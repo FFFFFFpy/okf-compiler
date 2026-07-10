@@ -1,9 +1,13 @@
-"""OKF Bundle paths, identities, and data structures."""
+"""OKF Bundle paths, identities, data structures, and evidence resolution."""
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+import os
+import re
+from dataclasses import dataclass, field, replace
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
 
 OKF_FORMAT = "okf-bundle"
 OKF_VERSION = 1
@@ -29,6 +33,7 @@ RELATIONS_DIR = "relations"
 PROPOSED_EDGES_JSONL = "relations/proposed_edges.jsonl"
 ASSETS_DIR = "assets"
 IMAGES_DIR = "assets/images"
+MEDIA_DIR = "assets/media"
 SOURCE_MAP_JSON = "source_map.json"
 SECTION_INDEX_WIDTH = 2
 SECTION_TYPE = "Section"
@@ -97,23 +102,49 @@ class SectioningResult:
 
 
 @dataclass
-class ImageRef:
+class AssetRef:
     original_ref: str
     dest_name: str
     source_path: str
     found: bool
     alt: str = ""
+    kind: str = "image"
+    bundle_dir: str = IMAGES_DIR
+
+    @property
+    def bundle_ref(self) -> str | None:
+        return f"{self.bundle_dir}/{self.dest_name}" if self.found else None
+
+
+ImageRef = AssetRef
 
 
 @dataclass
 class Evidence:
-    heading_path: str
-    line_start: int
-    line_end: int
+    heading_path: str = ""
+    line_start: int = 0
+    line_end: int = 0
     section_id: str = ""
+    quote: str = ""
 
     def is_valid(self) -> bool:
         return bool(self.heading_path) and self.line_start >= 1 and self.line_end >= self.line_start
+
+
+@dataclass
+class EvidenceValidation:
+    valid: bool
+    reason: str
+    evidence: Evidence | None = None
+    details: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "valid": self.valid,
+            "reason": self.reason,
+            "evidence": evidence_to_dict(self.evidence),
+            "details": self.details,
+        }
 
 
 @dataclass
@@ -150,20 +181,220 @@ class Extracts:
     entities: list[EntityExtract] = field(default_factory=list)
     relations: list[ProposedEdge] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    stage_stats: dict[str, dict] = field(default_factory=dict)
+    validation: list[dict] = field(default_factory=list)
+
+    @property
+    def degraded(self) -> bool:
+        return any(
+            str(stats.get("status", "")).lower() in {"degraded", "failed"}
+            for stats in self.stage_stats.values()
+        )
+
+
+def evidence_to_dict(evidence: Evidence | None) -> dict | None:
+    if evidence is None:
+        return None
+    return {
+        "section_id": evidence.section_id,
+        "heading_path": evidence.heading_path,
+        "line_start": evidence.line_start,
+        "line_end": evidence.line_end,
+        "quote": evidence.quote,
+    }
+
+
+def resolve_evidence(
+    evidence: Evidence | None,
+    sections: list[SectionSpec],
+    markdown: str,
+) -> EvidenceValidation:
+    """Resolve quote-based evidence to deterministic absolute line coordinates."""
+    if evidence is None:
+        return EvidenceValidation(False, "missing_evidence")
+
+    section_result = _select_section(evidence, sections)
+    if isinstance(section_result, EvidenceValidation):
+        return section_result
+    section = section_result
+
+    quote = evidence.quote.strip()
+    if quote:
+        return _locate_quote(section, markdown, quote)
+
+    return validate_evidence_detailed(evidence, sections, max(len(markdown.splitlines()), 1))
+
+
+def validate_evidence_detailed(
+    evidence: Evidence | None,
+    sections: list[SectionSpec],
+    total_lines: int,
+) -> EvidenceValidation:
+    if evidence is None:
+        return EvidenceValidation(False, "missing_evidence")
+    if not evidence.heading_path:
+        return EvidenceValidation(False, "missing_heading_path", evidence)
+    if evidence.line_start < 1:
+        return EvidenceValidation(False, "invalid_line_start", evidence)
+    if evidence.line_end < evidence.line_start:
+        return EvidenceValidation(False, "invalid_line_range", evidence)
+    if evidence.line_end > total_lines:
+        return EvidenceValidation(
+            False,
+            "line_end_out_of_document",
+            evidence,
+            {"total_lines": total_lines},
+        )
+
+    section_result = _select_section(evidence, sections)
+    if isinstance(section_result, EvidenceValidation):
+        return section_result
+    section = section_result
+    if not (section.line_start <= evidence.line_start <= evidence.line_end <= section.line_end):
+        return EvidenceValidation(
+            False,
+            "line_range_outside_section",
+            evidence,
+            {
+                "section_id": section.section_id,
+                "section_line_start": section.line_start,
+                "section_line_end": section.line_end,
+            },
+        )
+    return EvidenceValidation(True, "ok_legacy_line_evidence", evidence)
 
 
 def validate_evidence(evidence: Evidence | None, sections: list[SectionSpec], total_lines: int) -> bool:
-    if evidence is None or not evidence.is_valid():
-        return False
-    if evidence.line_end > total_lines:
-        return False
-    for sec in sections:
-        if evidence.section_id and sec.section_id != evidence.section_id:
+    return validate_evidence_detailed(evidence, sections, total_lines).valid
+
+
+def _select_section(
+    evidence: Evidence,
+    sections: list[SectionSpec],
+) -> SectionSpec | EvidenceValidation:
+    if not sections:
+        return EvidenceValidation(False, "no_sections", evidence)
+    if evidence.section_id:
+        matches = [sec for sec in sections if sec.section_id == evidence.section_id]
+        if not matches:
+            return EvidenceValidation(False, "unknown_section_id", evidence)
+        return matches[0]
+    if evidence.heading_path:
+        matches = [sec for sec in sections if sec.heading_path == evidence.heading_path]
+        if not matches:
+            return EvidenceValidation(False, "unknown_heading_path", evidence)
+        if len(matches) > 1:
+            return EvidenceValidation(False, "ambiguous_heading_path", evidence)
+        return matches[0]
+    return EvidenceValidation(False, "missing_section_locator", evidence)
+
+
+def _locate_quote(section: SectionSpec, markdown: str, quote: str) -> EvidenceValidation:
+    lines = markdown.splitlines(keepends=True)
+    section_text = "".join(lines[max(section.line_start - 1, 0) : min(section.line_end, len(lines))])
+
+    exact_positions = _all_positions(section_text, quote)
+    if len(exact_positions) == 1:
+        start = exact_positions[0]
+        return _resolved_quote(section, section_text, quote, start, start + len(quote), "ok_exact_quote")
+    if len(exact_positions) > 1:
+        return EvidenceValidation(
+            False,
+            "ambiguous_quote",
+            replace(section_evidence(section), quote=quote),
+            {"matches": len(exact_positions), "match_mode": "exact"},
+        )
+
+    normalized_text, mapping = _normalize_with_map(section_text)
+    normalized_quote = re.sub(r"\s+", " ", quote).strip()
+    normalized_positions = _all_positions(normalized_text, normalized_quote) if normalized_quote else []
+    if len(normalized_positions) == 1:
+        norm_start = normalized_positions[0]
+        norm_end = norm_start + len(normalized_quote) - 1
+        return _resolved_quote(
+            section,
+            section_text,
+            quote,
+            mapping[norm_start],
+            mapping[norm_end] + 1,
+            "ok_normalized_quote",
+        )
+    if len(normalized_positions) > 1:
+        return EvidenceValidation(
+            False,
+            "ambiguous_quote",
+            replace(section_evidence(section), quote=quote),
+            {"matches": len(normalized_positions), "match_mode": "normalized_whitespace"},
+        )
+    return EvidenceValidation(
+        False,
+        "quote_not_found",
+        replace(section_evidence(section), quote=quote),
+        {"section_id": section.section_id},
+    )
+
+
+def _resolved_quote(
+    section: SectionSpec,
+    section_text: str,
+    quote: str,
+    start: int,
+    end: int,
+    reason: str,
+) -> EvidenceValidation:
+    last_char = max(start, end - 1)
+    line_start = section.line_start + section_text[:start].count("\n")
+    line_end = section.line_start + section_text[:last_char].count("\n")
+    resolved = Evidence(
+        section_id=section.section_id,
+        heading_path=section.heading_path,
+        line_start=line_start,
+        line_end=max(line_start, line_end),
+        quote=quote,
+    )
+    return EvidenceValidation(True, reason, resolved)
+
+
+def section_evidence(section: SectionSpec) -> Evidence:
+    return Evidence(
+        section_id=section.section_id,
+        heading_path=section.heading_path,
+        line_start=section.line_start,
+        line_end=section.line_end,
+    )
+
+
+def _all_positions(text: str, needle: str) -> list[int]:
+    if not needle:
+        return []
+    positions: list[int] = []
+    start = 0
+    while True:
+        index = text.find(needle, start)
+        if index < 0:
+            return positions
+        positions.append(index)
+        start = index + 1
+
+
+def _normalize_with_map(text: str) -> tuple[str, list[int]]:
+    chars: list[str] = []
+    mapping: list[int] = []
+    in_space = False
+    for index, char in enumerate(text):
+        if char.isspace():
+            if chars and not in_space:
+                chars.append(" ")
+                mapping.append(index)
+            in_space = True
             continue
-        if not evidence.section_id and sec.heading_path != evidence.heading_path:
-            continue
-        return sec.line_start <= evidence.line_start <= evidence.line_end <= sec.line_end
-    return not sections and evidence.line_end <= total_lines
+        chars.append(char)
+        mapping.append(index)
+        in_space = False
+    while chars and chars[-1] == " ":
+        chars.pop()
+        mapping.pop()
+    return "".join(chars), mapping
 
 
 def okf_yaml_text(title: str) -> str:
@@ -182,13 +413,21 @@ def okf_yaml_text(title: str) -> str:
 
 
 def manifest_compiler_block(*, llm_enabled: bool, model: str | None) -> dict:
+    try:
+        version = package_version("okf-compiler")
+    except PackageNotFoundError:
+        version = "0+unknown"
     out = {
         "name": COMPILER_NAME,
+        "version": version,
         "mode": COMPILER_MODE,
         "global_read": False,
         "global_write": False,
         "llm_enabled": bool(llm_enabled),
     }
+    git_commit = os.environ.get("OKF_COMPILER_GIT_COMMIT", "").strip()
+    if git_commit:
+        out["git_commit"] = git_commit
     if model:
         out["model"] = model
     return out
