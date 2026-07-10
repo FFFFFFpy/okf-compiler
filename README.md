@@ -4,8 +4,6 @@ Compile one Markdown article into one isolated, self-contained **OKF Bundle** (`
 
 OKF Compiler follows a subtraction-first rule: every document starts fresh. A compile reads only the current Markdown file and its relative assets. It never reads or mutates a long-lived knowledge base, performs no global concept merge, and materializes no global backlinks.
 
-The project was extracted from the experimental `openkb/okf` subsystem in `FFFFFFpy/OpenKB` and made independent of the OpenKB runtime.
-
 ## What it produces
 
 ```text
@@ -20,7 +18,8 @@ article.okf.zip
 │   └── article.md
 ├── sections/
 ├── assets/
-│   └── images/
+│   ├── images/
+│   └── media/
 ├── extracts/
 │   ├── summary.md
 │   ├── concepts/
@@ -31,7 +30,8 @@ article.okf.zip
 ```
 
 - `sources/original.md` preserves the input verbatim.
-- `sources/article.md` is the portable source with image links rewritten to bundled assets.
+- `sources/article.md` is the portable source with local asset links rewritten into the bundle.
+- Referenced Markdown images and local HTML `img`, `video`, `audio`, and `source` assets are copied.
 - `sections/*.md` are split conservatively from real ATX headings.
 - LLM output is document-local and evidence-anchored. It is proposed knowledge, not a global wiki mutation.
 
@@ -59,8 +59,6 @@ uv sync --extra dev --extra llm
 
 ## Configure the LLM with `.env`
 
-Copy the included template and fill in your provider values:
-
 ```powershell
 Copy-Item .env.example .env
 ```
@@ -72,38 +70,19 @@ OKF_LLM_API_KEY=your-key
 OKF_LLM_TIMEOUT=120
 ```
 
-Then test the connection:
-
-```powershell
-uv run okf test-llm
-```
-
 Configuration priority is:
 
 ```text
 CLI flags > process environment > .env > defaults
 ```
 
-Dotenv discovery order is:
-
-1. `--env-file PATH`.
-2. The path in `OKF_ENV_FILE`.
-3. `.env` in the current working directory.
-4. `.env` beside the input Markdown or input directory.
-
-Only one dotenv file is loaded. An explicitly selected file must exist; a typo does not silently fall back to some unrelated `.env` lurking elsewhere like a credential poltergeist.
-
-Use a custom file when needed:
-
-```powershell
-uv run okf test-llm --env-file "D:\secrets\okf.env"
-```
-
-`.env` is ignored by Git. `.env.example` is safe to commit and contains no real credentials.
-
-For migration, the old `OPENKB_LLM_*` names remain accepted as fallback values.
+Dotenv discovery order is `--env-file`, `OKF_ENV_FILE`, `.env` in the current working directory, then `.env` beside the input.
 
 ## Compile one Markdown file
+
+```powershell
+uv run okf compile article.md
+```
 
 Without LLM:
 
@@ -111,33 +90,70 @@ Without LLM:
 uv run okf compile article.md --no-llm
 ```
 
-With `.env` configured, no repeated LLM flags are needed:
+By default the output is `article.okf.zip` beside the source file.
 
-```powershell
-uv run okf compile article.md
-```
+## Debug diagnostics
 
-CLI flags remain available for one-off overrides:
+Normal bundle logs stay compact. For structured sidecar diagnostics:
 
 ```powershell
 uv run okf compile article.md `
-  --base-url "https://api.example.com/v1" `
-  --model "your-model" `
-  --api-key "your-key"
+  --debug-dir ".\okf-debug"
 ```
 
-By default the output is `article.okf.zip` beside the source file.
+The run directory contains:
+
+```text
+okf-debug/<run>/
+├── run.json
+├── compiler.jsonl
+├── traceback.log              # only when an exception occurs
+└── validation/
+    ├── concepts.jsonl
+    ├── entities.jsonl
+    └── relations.jsonl
+```
+
+To additionally save full LLM prompts, raw responses, and parsed JSON:
+
+```powershell
+uv run okf compile article.md `
+  --debug-dir ".\okf-debug" `
+  --debug-llm-payloads
+```
+
+Full payload logs may contain the complete source article. API keys are not intentionally written, but debug directories should still be treated as private data.
+
+Use strict mode when degraded extraction must fail CI or a batch job:
+
+```powershell
+uv run okf compile article.md --strict
+```
+
+The bundle is still written for inspection, but the command returns a non-zero exit code when an extraction stage rejected output.
+
+## Evidence model
+
+New LLM extraction uses quote-based evidence:
+
+```json
+{
+  "section_id": "s0002",
+  "quote": "verbatim contiguous text copied from the document"
+}
+```
+
+The compiler locates the quote inside the selected section and calculates absolute `line_start` and `line_end`. This avoids asking an LLM to count Markdown lines. Legacy line-based evidence remains accepted for compatibility.
 
 ## Compile a wxarticle2md output directory
-
-`wxarticle2md --md-mode advanced-lite` produces one article directory containing one Markdown file and `assets/`. OKF Compiler can enumerate that layout directly:
 
 ```powershell
 uv run okf compile-dir `
   "D:\MyProjects\wxarticle2md\output" `
   --out "D:\MyProjects\okf-bundles" `
   --mode wechat `
-  --max-workers 3
+  --max-workers 3 `
+  --debug-dir "D:\MyProjects\okf-debug"
 ```
 
 Input selection priority in `wechat` mode:
@@ -155,8 +171,6 @@ Input selection priority in `wechat` mode:
 - Lower headings and conservative pseudo-heading matches become section anchors, not extra top-level sections.
 - If no suitable heading level exists, the document becomes one whole-document section.
 
-This deliberately favors stable, coarse sections over turning every bold sentence into a tiny knowledge fragment. Software has enough confetti already.
-
 ## Python API
 
 ```python
@@ -168,21 +182,13 @@ result = compile_one(
     Path("article.okf.zip"),
     CompileOptions(no_llm=True),
 )
-
-if not result.ok:
+if not result.successful:
     raise RuntimeError(result.error)
 ```
 
 ## Design boundaries
 
-OKF Compiler is a producer, not a knowledge-base runtime. Consumers such as OpenViking, WeKnora, or OpenKB may:
-
-- index sections, summaries, concepts, entities, and images separately;
-- resolve local concepts against global candidates;
-- accept or reject proposed edges;
-- materialize wiki pages or backlinks later.
-
-The compiler itself does none of those global operations.
+OKF Compiler is a producer, not a knowledge-base runtime. Consumers such as OpenViking, WeKnora, or OpenKB may index sections and extracts, resolve local concepts against global candidates, and accept or reject proposed edges. The compiler itself performs no global mutation.
 
 ## License and provenance
 

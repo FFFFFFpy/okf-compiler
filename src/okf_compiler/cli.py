@@ -28,6 +28,29 @@ def _llm_options(fn):
     return fn
 
 
+def _diagnostic_options(fn):
+    for decorator in (
+        click.option(
+            "--strict",
+            is_flag=True,
+            help="Return a non-zero exit code when extraction is degraded.",
+        ),
+        click.option(
+            "--debug-llm-payloads",
+            is_flag=True,
+            help="Save full LLM prompts and responses under --debug-dir.",
+        ),
+        click.option(
+            "--debug-dir",
+            type=click.Path(file_okay=False, path_type=Path),
+            default=None,
+            help="Write structured diagnostics outside the OKF bundle.",
+        ),
+    ):
+        fn = decorator(fn)
+    return fn
+
+
 def _resolve_llm_config(
     *,
     base_url: str | None,
@@ -46,6 +69,11 @@ def _resolve_llm_config(
     )
 
 
+def _validate_debug_options(debug_dir: Path | None, debug_llm_payloads: bool) -> None:
+    if debug_llm_payloads and debug_dir is None:
+        raise click.UsageError("--debug-llm-payloads requires --debug-dir")
+
+
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.version_option(package_name="okf-compiler")
 def main() -> None:
@@ -62,6 +90,7 @@ def main() -> None:
 @click.option("--language", default="zh", show_default=True)
 @click.option("--max-concepts", type=int, default=12, show_default=True)
 @click.option("--max-entities", type=int, default=12, show_default=True)
+@_diagnostic_options
 @_llm_options
 def compile_cmd(
     input_md: Path,
@@ -73,6 +102,9 @@ def compile_cmd(
     language: str,
     max_concepts: int,
     max_entities: int,
+    debug_dir: Path | None,
+    debug_llm_payloads: bool,
+    strict: bool,
     base_url: str | None,
     model: str | None,
     api_key: str | None,
@@ -80,6 +112,7 @@ def compile_cmd(
     env_file: Path | None,
 ) -> None:
     """Compile one Markdown file into one .okf.zip."""
+    _validate_debug_options(debug_dir, debug_llm_payloads)
     target = out or input_md.with_name(input_md.stem + ".okf.zip")
     config = None
     if not no_llm:
@@ -103,10 +136,13 @@ def compile_cmd(
             max_concepts=max_concepts,
             max_entities=max_entities,
             llm_config=config,
+            debug_dir=debug_dir,
+            debug_llm_payloads=debug_llm_payloads,
+            strict=strict,
         ),
     )
     _print_result(result)
-    if not result.ok:
+    if not result.successful:
         raise click.exceptions.Exit(1)
 
 
@@ -137,6 +173,7 @@ def compile_cmd(
 @click.option("--language", default="zh", show_default=True)
 @click.option("--max-concepts", type=int, default=12, show_default=True)
 @click.option("--max-entities", type=int, default=12, show_default=True)
+@_diagnostic_options
 @_llm_options
 def compile_dir_cmd(
     input_dir: Path,
@@ -153,6 +190,9 @@ def compile_dir_cmd(
     language: str,
     max_concepts: int,
     max_entities: int,
+    debug_dir: Path | None,
+    debug_llm_payloads: bool,
+    strict: bool,
     base_url: str | None,
     model: str | None,
     api_key: str | None,
@@ -160,6 +200,7 @@ def compile_dir_cmd(
     env_file: Path | None,
 ) -> None:
     """Compile a directory, producing one OKF Bundle per Markdown article."""
+    _validate_debug_options(debug_dir, debug_llm_payloads)
     config = None
     if not no_llm:
         config = _resolve_llm_config(
@@ -172,7 +213,14 @@ def compile_dir_cmd(
         )
 
     def progress(result, completed: int, total: int) -> None:
-        status = "OK" if result.ok else ("SKIP" if result.skipped else "FAIL")
+        if result.skipped:
+            status = "SKIP"
+        elif not result.successful:
+            status = "FAIL"
+        elif result.degraded:
+            status = "DEGRADED"
+        else:
+            status = "OK"
         click.echo(f"[{completed}/{total}] {status} {result.input_path.name}")
 
     report = compile_dir(
@@ -185,6 +233,9 @@ def compile_dir_cmd(
             max_concepts=max_concepts,
             max_entities=max_entities,
             llm_config=config,
+            debug_dir=debug_dir,
+            debug_llm_payloads=debug_llm_payloads,
+            strict=strict,
         ),
         mode=mode,
         glob_pattern=glob_pattern,
@@ -196,7 +247,7 @@ def compile_dir_cmd(
         progress_callback=progress,
     )
     click.echo(
-        f"Completed: {report.ok} ok, {report.skipped} skipped, "
+        f"Completed: {report.ok} ok, {report.degraded} degraded, {report.skipped} skipped, "
         f"{report.failed} failed, {report.total} total"
     )
     if report.failed:
@@ -230,16 +281,30 @@ def test_llm_cmd(
 
 def _print_result(result) -> None:
     if result.ok:
-        click.echo(f"OKF bundle written: {result.output_path}")
+        suffix = " with degraded extraction" if result.degraded else ""
+        click.echo(f"OKF bundle written{suffix}: {result.output_path}")
         counts = (result.manifest or {}).get("counts", {})
-        click.echo(
-            "Counts: " + ", ".join(f"{key}={value}" for key, value in counts.items())
-        )
+        click.echo("Counts: " + ", ".join(f"{key}={value}" for key, value in counts.items()))
+        stages = ((result.manifest or {}).get("extraction") or {}).get("stages", {})
+        for stage, stats in stages.items():
+            if "returned" in stats:
+                click.echo(
+                    f"Extraction {stage}: {stats.get('accepted', 0)}/{stats.get('returned', 0)} "
+                    f"accepted ({stats.get('status', 'unknown')})"
+                )
+            else:
+                click.echo(f"Extraction {stage}: {stats.get('status', 'unknown')}")
         for warning in result.warnings:
             click.echo(f"Warning: {warning}", err=True)
+        if result.debug_dir:
+            click.echo(f"Debug diagnostics: {result.debug_dir}")
+        if result.strict_failed:
+            click.echo(f"Strict failure: {result.error}", err=True)
     else:
         state = "skipped" if result.skipped else "failed"
         click.echo(f"Compile {state}: {result.error}", err=True)
+        if result.debug_dir:
+            click.echo(f"Debug diagnostics: {result.debug_dir}", err=True)
 
 
 if __name__ == "__main__":

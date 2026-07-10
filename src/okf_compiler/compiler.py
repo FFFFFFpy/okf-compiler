@@ -2,22 +2,25 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from .assets import collect_images, count_missing
+from .assets import collect_assets, count_missing
 from .atomic import atomic_write_json
 from .bundle import write_zip
+from .diagnostics import DebugRecorder
 from .frontmatter import parse as parse_frontmatter
 from .llm import LLMClient, LLMConfig, extract, redact_secrets
 from .markdown import extract_title, split_sections
 from .render import render_bundle
-from .schema import Extracts
+from .schema import Extracts, slugify
 
 OKF_ZIP_SUFFIX = ".okf.zip"
 DEFAULT_REPORT_NAME = "batch_report.json"
@@ -34,6 +37,9 @@ class CompileOptions:
     max_concepts: int = 12
     max_entities: int = 12
     llm_config: LLMConfig | None = None
+    debug_dir: Path | None = None
+    debug_llm_payloads: bool = False
+    strict: bool = False
 
 
 @dataclass
@@ -46,6 +52,13 @@ class CompileResult:
     manifest: dict | None = None
     warnings: list[str] = field(default_factory=list)
     workdir_path: Path | None = None
+    debug_dir: Path | None = None
+    degraded: bool = False
+    strict_failed: bool = False
+
+    @property
+    def successful(self) -> bool:
+        return self.ok and not self.strict_failed
 
     def to_report(
         self,
@@ -53,13 +66,23 @@ class CompileResult:
         input_root: Path | None = None,
         output_root: Path | None = None,
     ) -> dict:
+        if self.skipped:
+            status = "skipped"
+        elif not self.ok or self.strict_failed:
+            status = "failed"
+        elif self.degraded:
+            status = "degraded"
+        else:
+            status = "ok"
         return {
             "input": _relative(self.input_path, input_root),
             "output": _relative(self.output_path, output_root) if self.output_path else None,
-            "status": "skipped" if self.skipped else ("ok" if self.ok else "failed"),
+            "status": status,
             "error": self.error or None,
             "counts": (self.manifest or {}).get("counts"),
+            "extraction": (self.manifest or {}).get("extraction"),
             "warnings": self.warnings,
+            "debug_dir": str(self.debug_dir) if self.debug_dir else None,
         }
 
 
@@ -67,6 +90,7 @@ class CompileResult:
 class BatchReport:
     total: int = 0
     ok: int = 0
+    degraded: int = 0
     skipped: int = 0
     failed: int = 0
     results: list[CompileResult] = field(default_factory=list)
@@ -77,6 +101,7 @@ class BatchReport:
         return {
             "total": self.total,
             "ok": self.ok,
+            "degraded": self.degraded,
             "skipped": self.skipped,
             "failed": self.failed,
             "results": [
@@ -100,23 +125,45 @@ def compile_one(input_md: Path, out: Path, opts: CompileOptions) -> CompileResul
         return CompileResult(input_md, out, False, skipped=True, error="output exists")
 
     workdir = _create_workdir(opts)
+    debug_path = _create_debug_dir(opts.debug_dir, input_md) if opts.debug_dir else None
+    debug = (
+        DebugRecorder(debug_path, include_llm_payloads=opts.debug_llm_payloads)
+        if debug_path
+        else None
+    )
     warnings: list[str] = []
+    if debug:
+        debug.event(
+            "compile_started",
+            input=str(input_md),
+            output=str(out),
+            workdir=str(workdir),
+            no_llm=opts.no_llm,
+            strict=opts.strict,
+        )
     try:
         markdown = input_md.read_text(encoding="utf-8")
         source_metadata = parse_frontmatter(markdown)
         sectioning = split_sections(markdown)
         sections = sectioning.sections
         title = extract_title(markdown) or str(source_metadata.get("title") or input_md.stem)
-        images_dir = workdir / "assets" / "images"
-        rewritten, normalized_source, image_refs, asset_warnings = collect_images(
+        rewritten, normalized_source, asset_refs, asset_warnings = collect_assets(
             [section.body for section in sections],
             markdown,
             input_md.parent,
-            images_dir,
+            workdir,
         )
         warnings.extend(asset_warnings)
         for section, body in zip(sections, rewritten):
             section.body = body
+        if debug:
+            debug.event(
+                "source_prepared",
+                markdown_lines=max(len(markdown.splitlines()), 1),
+                sections=len(sections),
+                assets_found=sum(ref.found for ref in asset_refs),
+                assets_missing=count_missing(asset_refs),
+            )
 
         extracts = Extracts()
         llm_enabled = False
@@ -132,22 +179,24 @@ def compile_one(input_md: Path, out: Path, opts: CompileOptions) -> CompileResul
                     language=opts.language,
                     max_concepts=opts.max_concepts,
                     max_entities=opts.max_entities,
+                    debug=debug,
                 )
                 llm_enabled = True
             except Exception as exc:  # noqa: BLE001
-                warnings.append(
-                    redact_secrets(f"llm disabled: {type(exc).__name__}: {exc}")
-                )
-        missing = count_missing(image_refs)
+                warnings.append(redact_secrets(f"llm disabled: {type(exc).__name__}: {exc}"))
+                if debug:
+                    api_key = opts.llm_config.api_key if opts.llm_config else None
+                    debug.traceback(exc, sanitizer=lambda text: redact_secrets(text, api_key))
+        missing = count_missing(asset_refs)
         if missing:
-            warnings.append(f"assets: {missing} referenced image(s) not found")
+            warnings.append(f"assets: {missing} referenced local asset(s) not found")
 
         manifest = render_bundle(
             workdir,
             original_markdown=markdown,
             normalized_markdown=normalized_source,
             sections=sections,
-            image_refs=image_refs,
+            asset_refs=asset_refs,
             extracts=extracts,
             original_filename=input_md.name,
             title=title,
@@ -159,22 +208,39 @@ def compile_one(input_md: Path, out: Path, opts: CompileOptions) -> CompileResul
             source_metadata=_source_metadata(source_metadata),
         )
         write_zip(workdir, out)
-        return CompileResult(
+        degraded = extracts.degraded
+        strict_failed = bool(opts.strict and degraded)
+        error = "strict mode rejected degraded extraction" if strict_failed else ""
+        result = CompileResult(
             input_md,
             out,
             True,
+            error=error,
             manifest=manifest,
             warnings=warnings + extracts.warnings,
             workdir_path=workdir if opts.keep_workdir else None,
+            debug_dir=debug_path,
+            degraded=degraded,
+            strict_failed=strict_failed,
         )
+        if debug:
+            debug.finish(result.to_report())
+        return result
     except Exception as exc:  # noqa: BLE001
-        return CompileResult(
+        error = redact_secrets(f"{type(exc).__name__}: {exc}")
+        result = CompileResult(
             input_md,
             out,
             False,
-            error=redact_secrets(f"{type(exc).__name__}: {exc}"),
+            error=error,
             workdir_path=workdir if opts.keep_workdir else None,
+            debug_dir=debug_path,
         )
+        if debug:
+            api_key = opts.llm_config.api_key if opts.llm_config else None
+            debug.traceback(exc, sanitizer=lambda text: redact_secrets(text, api_key))
+            debug.finish(result.to_report())
+        return result
     finally:
         if not opts.keep_workdir:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -213,12 +279,14 @@ def compile_dir(
     def record(result: CompileResult) -> None:
         nonlocal completed
         report.results.append(result)
-        if result.ok:
-            report.ok += 1
-        elif result.skipped:
+        if result.skipped:
             report.skipped += 1
-        else:
+        elif not result.successful:
             report.failed += 1
+        elif result.degraded:
+            report.degraded += 1
+        else:
+            report.ok += 1
         completed += 1
         if progress_callback:
             progress_callback(result, completed, report.total)
@@ -260,7 +328,7 @@ def compile_dir(
         for item in pending:
             result = run(item)
             record(result)
-            if fail_fast and not result.ok and not result.skipped:
+            if fail_fast and not result.successful and not result.skipped:
                 break
     else:
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -273,10 +341,10 @@ def compile_dir(
                         futures[future][0],
                         None,
                         False,
-                        error=str(exc),
+                        error=redact_secrets(f"{type(exc).__name__}: {exc}"),
                     )
                 record(result)
-                if fail_fast and not result.ok and not result.skipped:
+                if fail_fast and not result.successful and not result.skipped:
                     for other in futures:
                         other.cancel()
                     break
@@ -358,12 +426,7 @@ def _flat_inputs(input_dir: Path, glob_pattern: str, recursive: bool) -> list[Pa
         if not path.is_file() or path.suffix.lower() not in _MD_SUFFIXES:
             continue
         rel = path.relative_to(input_dir)
-        excluded = {
-            ".git",
-            ".venv",
-            "node_modules",
-            "__pycache__",
-        }
+        excluded = {".git", ".venv", "node_modules", "__pycache__"}
         if any(part in excluded or part.endswith(".okf") for part in rel.parts[:-1]):
             continue
         if glob_pattern not in {"*.md", "*"} and not path.match(glob_pattern):
@@ -377,11 +440,7 @@ def _output_name(md: Path, used: set[str], *, relative_to: Path) -> str:
     if base not in used:
         return base
     parent = md.relative_to(relative_to).parent.name
-    candidate = (
-        f"{parent}__{base}"
-        if parent
-        else f"{md.stem}_{len(used)}{OKF_ZIP_SUFFIX}"
-    )
+    candidate = f"{parent}__{base}" if parent else f"{md.stem}_{len(used)}{OKF_ZIP_SUFFIX}"
     n = 1
     while candidate in used:
         candidate = f"{parent}__{md.stem}_{n}{OKF_ZIP_SUFFIX}"
@@ -392,10 +451,21 @@ def _output_name(md: Path, used: set[str], *, relative_to: Path) -> str:
 def _create_workdir(opts: CompileOptions) -> Path:
     if opts.workdir:
         Path(opts.workdir).mkdir(parents=True, exist_ok=True)
-        return Path(
-            tempfile.mkdtemp(prefix="okf-compile-", dir=opts.workdir)
-        ).resolve()
+        return Path(tempfile.mkdtemp(prefix="okf-compile-", dir=opts.workdir)).resolve()
     return Path(tempfile.mkdtemp(prefix="okf-compile-")).resolve()
+
+
+def _create_debug_dir(root: Path | None, input_md: Path) -> Path | None:
+    if root is None:
+        return None
+    root = Path(root).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    digest = hashlib.sha1(str(input_md).encode()).hexdigest()[:8]
+    name = slugify(input_md.stem) or "document"
+    path = root / f"{stamp}_{name[:48]}_{digest}"
+    path.mkdir(parents=True, exist_ok=False)
+    return path
 
 
 def _source_metadata(metadata: dict) -> dict:
@@ -405,11 +475,7 @@ def _source_metadata(metadata: dict) -> dict:
         "published_at": metadata.get("published_at") or metadata.get("publish_time"),
         "converter": metadata.get("converted_by"),
     }
-    return {
-        key: value
-        for key, value in mapping.items()
-        if value not in (None, "")
-    }
+    return {key: value for key, value in mapping.items() if value not in (None, "")}
 
 
 def _relative(path: Path | None, root: Path | None) -> str | None:
@@ -418,6 +484,6 @@ def _relative(path: Path | None, root: Path | None) -> str | None:
     try:
         if root:
             return path.resolve().relative_to(root.resolve()).as_posix()
-        return path.as_posix()
     except ValueError:
-        return path.as_posix()
+        pass
+    return str(path)

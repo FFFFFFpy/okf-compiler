@@ -20,10 +20,19 @@ def _section_map(sections: list[SectionSpec]) -> str:
     return json.dumps(rows, ensure_ascii=False, indent=2)
 
 
+def _evidence_contract() -> str:
+    return (
+        'Evidence MUST be an object exactly shaped as '
+        '{"section_id":"s0001","quote":"verbatim contiguous text copied from Document"}. '
+        "The quote must occur once inside that section, contain no ellipsis or paraphrase, and must not "
+        "include invented line numbers. The compiler resolves quote text to absolute source lines."
+    )
+
+
 def summary_messages(markdown: str, sections: list[SectionSpec], language: str) -> tuple[str, str]:
     system = (
         "You summarize one Markdown document in isolation. Do not use external knowledge. "
-        "Return JSON only: {\"summary\": \"...\"}."
+        'Return JSON only: {"summary": "..."}.'
     )
     user = f"Language: {language}\nSections:\n{_section_map(sections)}\n\nDocument:\n{markdown}"
     return system, user
@@ -34,8 +43,7 @@ def concepts_messages(
 ) -> tuple[str, str]:
     system = (
         "Extract document-local concepts. Return JSON only with a concepts array. Each item needs "
-        "name, description, confidence, and evidence containing section_id, heading_path, "
-        "line_start, line_end. Evidence must match the supplied section map."
+        "name, description, confidence, and evidence. " + _evidence_contract()
     )
     user = (
         f"Maximum concepts: {max_concepts}\nSummary: {summary}\n"
@@ -54,7 +62,7 @@ def entities_messages(
 ) -> tuple[str, str]:
     system = (
         "Extract document-local named entities. Return JSON only with an entities array. Each item "
-        "needs name, type, description, aliases, confidence, and valid section evidence."
+        "needs name, type, description, aliases, confidence, and evidence. " + _evidence_contract()
     )
     concept_names = [c.name for c in concepts]
     user = (
@@ -74,7 +82,8 @@ def relations_messages(
 ) -> tuple[str, str]:
     system = (
         "Propose relations between the supplied local concepts/entities only. Return JSON only with "
-        "a relations array. Each relation needs subject, relation, object, note, and valid evidence."
+        "a relations array. Each relation needs subject, relation, object, note, and evidence. "
+        + _evidence_contract()
     )
     nodes = [c.name for c in concepts] + [e.name for e in entities]
     user = (
