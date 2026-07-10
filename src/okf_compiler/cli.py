@@ -16,9 +16,34 @@ def _llm_options(fn):
         click.option("--api-key", default=None, help="LLM API key. Env: OKF_LLM_API_KEY."),
         click.option("--model", default=None, help="LLM model. Env: OKF_LLM_MODEL."),
         click.option("--base-url", default=None, help="OpenAI-compatible base URL."),
+        click.option(
+            "--env-file",
+            type=click.Path(exists=True, dir_okay=False, path_type=Path),
+            default=None,
+            envvar="OKF_ENV_FILE",
+            help="Dotenv file. Defaults to .env in CWD, then beside the input.",
+        ),
     ):
         fn = decorator(fn)
     return fn
+
+
+def _resolve_llm_config(
+    *,
+    base_url: str | None,
+    model: str | None,
+    api_key: str | None,
+    timeout: float | None,
+    env_file: Path | None,
+    search_dir: Path,
+):
+    return resolve_config(
+        base_url=base_url,
+        model=model,
+        api_key=api_key,
+        timeout=timeout,
+        dotenv=load_dotenv_values(env_file, search_dirs=[search_dir]),
+    )
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -52,17 +77,19 @@ def compile_cmd(
     model: str | None,
     api_key: str | None,
     timeout: float | None,
+    env_file: Path | None,
 ) -> None:
     """Compile one Markdown file into one .okf.zip."""
     target = out or input_md.with_name(input_md.stem + ".okf.zip")
     config = None
     if not no_llm:
-        config = resolve_config(
+        config = _resolve_llm_config(
             base_url=base_url,
             model=model,
             api_key=api_key,
             timeout=timeout,
-            dotenv=load_dotenv_values(),
+            env_file=env_file,
+            search_dir=input_md.parent,
         )
     result = compile_one(
         input_md,
@@ -130,16 +157,18 @@ def compile_dir_cmd(
     model: str | None,
     api_key: str | None,
     timeout: float | None,
+    env_file: Path | None,
 ) -> None:
     """Compile a directory, producing one OKF Bundle per Markdown article."""
     config = None
     if not no_llm:
-        config = resolve_config(
+        config = _resolve_llm_config(
             base_url=base_url,
             model=model,
             api_key=api_key,
             timeout=timeout,
-            dotenv=load_dotenv_values(),
+            env_file=env_file,
+            search_dir=input_dir,
         )
 
     def progress(result, completed: int, total: int) -> None:
@@ -181,14 +210,16 @@ def test_llm_cmd(
     model: str | None,
     api_key: str | None,
     timeout: float | None,
+    env_file: Path | None,
 ) -> None:
     """Test the configured OpenAI-compatible endpoint."""
-    config = resolve_config(
+    config = _resolve_llm_config(
         base_url=base_url,
         model=model,
         api_key=api_key,
         timeout=timeout,
-        dotenv=load_dotenv_values(),
+        env_file=env_file,
+        search_dir=Path.cwd(),
     )
     try:
         click.echo(LLMClient(config).test())
