@@ -7,6 +7,7 @@ from click.testing import CliRunner
 from okf_compiler.assets import collect_images
 from okf_compiler.cli import main
 from okf_compiler.compiler import CompileOptions, compile_dir, compile_one, enumerate_inputs
+from okf_compiler.llm import load_dotenv_values, resolve_config
 from okf_compiler.markdown import extract_title, split_sections
 
 
@@ -133,3 +134,63 @@ def test_cli_compile_no_llm(tmp_path: Path):
     )
     assert result.exit_code == 0, result.output
     assert out.is_file()
+
+
+def test_dotenv_discovery_and_config_precedence(tmp_path: Path, monkeypatch):
+    (tmp_path / ".env").write_text(
+        "OKF_LLM_BASE_URL=https://dotenv.example/v1\n"
+        "OKF_LLM_MODEL=dotenv-model\n"
+        "OKF_LLM_API_KEY=dotenv-key\n"
+        "OKF_LLM_TIMEOUT=45\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    dotenv = load_dotenv_values(env={})
+    config = resolve_config(
+        base_url=None,
+        model=None,
+        api_key="cli-key",
+        timeout=None,
+        env={"OKF_LLM_MODEL": "env-model"},
+        dotenv=dotenv,
+    )
+    assert config.base_url == "https://dotenv.example/v1"
+    assert config.model == "env-model"
+    assert config.api_key == "cli-key"
+    assert config.timeout == 45
+
+
+def test_dotenv_discovery_falls_back_to_input_dir(tmp_path: Path, monkeypatch):
+    cwd = tmp_path / "cwd"
+    input_dir = tmp_path / "articles"
+    cwd.mkdir()
+    input_dir.mkdir()
+    (input_dir / ".env").write_text("OKF_LLM_MODEL=input-model\n", encoding="utf-8")
+    monkeypatch.chdir(cwd)
+    values = load_dotenv_values(search_dirs=[input_dir], env={})
+    assert values["OKF_LLM_MODEL"] == "input-model"
+
+
+def test_cli_test_llm_accepts_env_file(tmp_path: Path, monkeypatch):
+    env_file = tmp_path / "custom.env"
+    env_file.write_text(
+        "OKF_LLM_BASE_URL=https://custom.example/v1\n"
+        "OKF_LLM_MODEL=custom-model\n"
+        "OKF_LLM_API_KEY=custom-key\n",
+        encoding="utf-8",
+    )
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, config):
+            captured["config"] = config
+
+        def test(self):
+            return '{"ok": true}'
+
+    monkeypatch.setattr("okf_compiler.cli.LLMClient", FakeClient)
+    result = CliRunner().invoke(main, ["test-llm", "--env-file", str(env_file)])
+    assert result.exit_code == 0, result.output
+    assert captured["config"].base_url == "https://custom.example/v1"
+    assert captured["config"].model == "custom-model"
+    assert captured["config"].api_key == "custom-key"
