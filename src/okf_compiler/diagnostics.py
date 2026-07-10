@@ -28,27 +28,36 @@ class DebugRecorder:
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    def stage_request(self, stage: str, system: str, user: str) -> None:
+    def stage_request(self, stage: str, system: str, user: str, *, attempt: int = 1) -> None:
         self.event(
             "llm_request",
             stage=stage,
+            attempt=attempt,
             system_chars=len(system),
             user_chars=len(user),
             payload_saved=self.include_llm_payloads,
         )
         if self.include_llm_payloads:
-            base = self.root / "stages" / stage
+            base = self._stage_base(stage, attempt)
             atomic_write_json(base / "request.json", {"system": system, "user": user})
 
-    def stage_response(self, stage: str, raw: str, parsed: object | None = None) -> None:
+    def stage_response(
+        self,
+        stage: str,
+        raw: str,
+        parsed: object | None = None,
+        *,
+        attempt: int = 1,
+    ) -> None:
         self.event(
             "llm_response",
             stage=stage,
+            attempt=attempt,
             response_chars=len(raw),
             payload_saved=self.include_llm_payloads,
         )
         if self.include_llm_payloads:
-            base = self.root / "stages" / stage
+            base = self._stage_base(stage, attempt)
             atomic_write_text(base / "response.raw.txt", raw)
             if parsed is not None:
                 atomic_write_json(base / "response.parsed.json", parsed)
@@ -84,6 +93,10 @@ class DebugRecorder:
     def finish(self, data: dict) -> None:
         payload = {"finished_at": _now(), **data, "events": self._events}
         atomic_write_json(self.root / "run.json", payload)
+
+    def _stage_base(self, stage: str, attempt: int) -> Path:
+        base = self.root / "stages" / stage
+        return base if attempt == 1 else base / f"attempt-{attempt}"
 
 
 def _now() -> str:
